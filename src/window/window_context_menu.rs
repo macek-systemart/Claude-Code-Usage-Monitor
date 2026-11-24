@@ -38,7 +38,7 @@ pub(super) fn show_context_menu_document(
             TPM_RIGHTBUTTON | TPM_RETURNCMD,
             point.x,
             point.y,
-            0,
+            None,
             hwnd,
             None,
         )
@@ -57,12 +57,13 @@ pub(super) fn context_menu_data_context(origin: Option<&(usize, String)>) -> Dat
     let Some(state) = state.as_ref() else {
         return DataContext::from_usage(None, &Canvas::default());
     };
-    let runtime = theme_runtime_from_state(state);
+    let mut runtime = theme_runtime_from_state(state);
     let mut canvas = Canvas::default();
     if let Some(theme) = effective_theme_from_state(state) {
         let surface_index = origin.map_or(0, |(surface_index, _)| *surface_index);
         if theme.surfaces.get(surface_index).is_some() {
-            let (width, height) = theme_engine::resolve_surface_size(
+            runtime = theme_runtime_for_surface(&theme, surface_index, runtime);
+            let (width, height) = theme_engine::resolve_surface_content_size(
                 &theme,
                 surface_index,
                 state.data.as_ref(),
@@ -84,6 +85,9 @@ unsafe fn append_context_menu_items(
     actions: &mut Vec<ContextMenuAction>,
 ) {
     for item in items {
+        if !item.should_render(context) {
+            continue;
+        }
         match &item.kind {
             ContextMenuItemKind::Separator => {
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -141,7 +145,10 @@ pub(super) fn context_menu_action_flags(
             state.poll_interval_ms == seconds.saturating_mul(1_000)
         }
         ContextMenuAction::ToggleProvider { provider } => state.providers.contains(*provider),
+        ContextMenuAction::ToggleAntigravityGemini => state.show_antigravity_gemini,
+        ContextMenuAction::ToggleAntigravityExternal => state.show_antigravity_external,
         ContextMenuAction::ToggleStartup => is_startup_enabled(),
+        ContextMenuAction::ToggleTaskbarLock => state.lock_taskbar,
         ContextMenuAction::ToggleWidget => state
             .active_theme
             .as_ref()
@@ -151,11 +158,16 @@ pub(super) fn context_menu_action_flags(
                     &state.mouse_action_overrides,
                 );
                 context_menu_widget_origin(&effective).map(|(surface_index, _)| {
+                    let runtime = theme_runtime_for_surface(
+                        &effective,
+                        surface_index,
+                        theme_runtime_from_state(state),
+                    );
                     theme_engine::surface_should_render(
                         &effective,
                         surface_index,
                         state.data.as_ref(),
-                        theme_runtime_from_state(state),
+                        runtime,
                     )
                 })
             })
@@ -177,18 +189,16 @@ pub(super) fn context_menu_action_flags(
                     theme,
                     &state.mouse_action_overrides,
                 );
-                effective
-                    .surfaces
-                    .iter()
-                    .position(|surface| surface.id.eq_ignore_ascii_case(target))
-                    .map(|surface_index| {
-                        theme_engine::surface_should_render(
-                            &effective,
-                            surface_index,
-                            state.data.as_ref(),
-                            theme_runtime_from_state(state),
-                        )
-                    })
+                // STATE is already locked here. Match the action's first-surface
+                // fallback without calling the helper that locks STATE again.
+                let origin_surface = origin.map_or(0, |(surface_index, _)| *surface_index);
+                toggle_layer_render_state(
+                    &effective,
+                    origin_surface,
+                    target,
+                    state.data.as_ref(),
+                    theme_runtime_from_state(state),
+                )
             })
             .unwrap_or(false),
         _ => false,
@@ -208,6 +218,49 @@ pub(super) fn context_menu_action_flags(
         (false, true) => MF_GRAYED,
         (false, false) => MENU_ITEM_FLAGS(0),
     }
+}
+
+/// Whether a `toggle_layer_render` target currently draws, so its menu row can
+/// carry a check mark. The target is a surface id, or a layer inside the
+/// surface the menu was opened from, which is what the action itself toggles.
+/// An unknown id has no state to report.
+pub(super) fn toggle_layer_render_state(
+    theme: &ThemeDocument,
+    origin_surface: usize,
+    target: &str,
+    data: Option<&AppUsageData>,
+    base_runtime: ThemeRuntime,
+) -> Option<bool> {
+    if let Some(surface_index) = theme
+        .surfaces
+        .iter()
+        .position(|surface| surface.id.eq_ignore_ascii_case(target))
+    {
+        let runtime = theme_runtime_for_surface(theme, surface_index, base_runtime);
+        return Some(theme_engine::surface_should_render(
+            theme,
+            surface_index,
+            data,
+            runtime,
+        ));
+    }
+    let object_index = theme
+        .surfaces
+        .get(origin_surface)?
+        .children
+        .iter()
+        .position(|object| object.id.eq_ignore_ascii_case(target))?;
+    let runtime = theme_runtime_for_surface(theme, origin_surface, base_runtime);
+    Some(
+        theme_engine::resolve_object_bounds_with_runtime(
+            theme,
+            origin_surface,
+            object_index,
+            data,
+            runtime,
+        )
+        .is_some(),
+    )
 }
 
 pub(super) fn context_menu_action_origin(
@@ -252,25 +305,15 @@ pub(super) fn execute_context_menu_action(
         ContextMenuAction::ToggleProvider { provider } => {
             Some(provider.descriptor().native_menu_command_id)
         }
+        ContextMenuAction::ToggleAntigravityGemini => Some(IDM_PROVIDER_ANTIGRAVITY_GEMINI),
+        ContextMenuAction::ToggleAntigravityExternal => Some(IDM_PROVIDER_ANTIGRAVITY_EXTERNAL),
         ContextMenuAction::ToggleStartup => Some(IDM_START_WITH_WINDOWS),
+        ContextMenuAction::ToggleTaskbarLock => Some(IDM_LOCK_TASKBAR),
         ContextMenuAction::SetLanguage { language } => {
             if language.eq_ignore_ascii_case("system") {
                 Some(IDM_LANG_SYSTEM)
             } else {
-                LanguageId::from_code(language).map(|language| match language {
-                    LanguageId::English => IDM_LANG_ENGLISH,
-                    LanguageId::Czech => IDM_LANG_CZECH,
-                    LanguageId::Dutch => IDM_LANG_DUTCH,
-                    LanguageId::Spanish => IDM_LANG_SPANISH,
-                    LanguageId::French => IDM_LANG_FRENCH,
-                    LanguageId::German => IDM_LANG_GERMAN,
-                    LanguageId::Japanese => IDM_LANG_JAPANESE,
-                    LanguageId::Korean => IDM_LANG_KOREAN,
-                    LanguageId::TraditionalChinese => IDM_LANG_TRADITIONAL_CHINESE,
-                    LanguageId::SimplifiedChinese => IDM_LANG_SIMPLIFIED_CHINESE,
-                    LanguageId::Russian => IDM_LANG_RUSSIAN,
-                    LanguageId::PortugueseBrazil => IDM_LANG_PORTUGUESE_BRAZIL,
-                })
+                LanguageId::from_code(language).map(language_menu_command_id)
             }
         }
         ContextMenuAction::CheckForUpdates => Some(IDM_VERSION_ACTION),
@@ -283,7 +326,12 @@ pub(super) fn execute_context_menu_action(
     };
     if let Some(command) = static_command {
         unsafe {
-            let _ = PostMessageW(hwnd, WM_COMMAND, WPARAM(command as usize), LPARAM(0));
+            let _ = PostMessageW(
+                Some(controller_for(hwnd)),
+                WM_COMMAND,
+                WPARAM(command as usize),
+                LPARAM(0),
+            );
         }
         return;
     }
@@ -312,21 +360,158 @@ pub(super) fn execute_context_menu_action(
             };
             let _ = execute_mouse_action_source(surface_index, &self_id, &actions);
         }
-        ContextMenuAction::OpenUrl { url } if context_menu::supported_url(&url) => unsafe {
-            let operation = native_interop::wide_str("open");
-            let url = native_interop::wide_str(url.trim());
-            let result = ShellExecuteW(
-                hwnd,
-                PCWSTR::from_raw(operation.as_ptr()),
-                PCWSTR::from_raw(url.as_ptr()),
-                PCWSTR::null(),
-                PCWSTR::null(),
-                SW_SHOWNORMAL,
-            );
-            if result.0 as isize <= 32 {
-                diagnose::log("context menu URL could not be opened");
-            }
-        },
+        ContextMenuAction::OpenUrl { url } => {
+            open_web_url(hwnd, &url, "context menu URL could not be opened")
+        }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::{GetMenuItemCount, GetMenuItemID, GetSubMenu};
+
+    #[test]
+    fn conditional_native_rows_and_subtrees_preserve_action_ids_on_each_open() {
+        let mut conditional = vec![
+            ContextMenuItem::text("usage", "Weekly usage"),
+            ContextMenuItem::separator("divider"),
+            ContextMenuItem::action("refresh", "Refresh", ContextMenuAction::Refresh),
+            ContextMenuItem::submenu(
+                "provider",
+                "Provider",
+                vec![ContextMenuItem::action(
+                    "nested",
+                    "Exit",
+                    ContextMenuAction::Exit,
+                )],
+            ),
+        ];
+        for item in &mut conditional {
+            item.render = theme_engine::Expression("providers.codex.enabled".into());
+        }
+        // This row stays hidden even when its parent becomes visible.
+        if let ContextMenuItemKind::Submenu { items } = &mut conditional[3].kind {
+            let mut hidden = ContextMenuItem::text("hidden", "Hidden child");
+            hidden.render = theme_engine::Expression("0".into());
+            items.insert(0, hidden);
+        }
+        conditional.push(ContextMenuItem::action(
+            "exit",
+            "Exit",
+            ContextMenuAction::Exit,
+        ));
+        let mut context = DataContext::from_usage(None, &Canvas::default());
+        for enabled in [false, true, false] {
+            context.insert("providers.codex.enabled", enabled as u8 as f64);
+            let mut actions = Vec::new();
+            unsafe {
+                let menu = CreatePopupMenu().unwrap();
+                append_context_menu_items(
+                    menu,
+                    &conditional,
+                    localization::detect_system_language(),
+                    &context,
+                    None,
+                    &mut actions,
+                );
+                let count = GetMenuItemCount(Some(menu));
+                let last_id = GetMenuItemID(menu, count - 1);
+                let child_count = if enabled {
+                    let submenu = GetSubMenu(menu, 3);
+                    Some((GetMenuItemCount(Some(submenu)), GetMenuItemID(submenu, 0)))
+                } else {
+                    None
+                };
+                DestroyMenu(menu).unwrap();
+                assert_eq!(count, if enabled { 5 } else { 1 });
+                assert_eq!(last_id, if enabled { 1002 } else { 1000 });
+                if enabled {
+                    assert_eq!(child_count, Some((1, 1001)));
+                    assert_eq!(
+                        actions,
+                        vec![
+                            ContextMenuAction::Refresh,
+                            ContextMenuAction::Exit,
+                            ContextMenuAction::Exit
+                        ]
+                    );
+                } else {
+                    assert_eq!(actions, vec![ContextMenuAction::Exit]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_layer_toggle_row_reports_the_layer_state_a_surface_row_already_reported() {
+        let mut theme = ThemeDocument::starter();
+        let runtime = ThemeRuntime::new(true, true, true);
+        let surface_id = theme.surfaces[0].id.clone();
+        let layer_id = theme.surfaces[0].children[0].id.clone();
+        theme.surfaces[0].children[0].render = 1.0.into();
+        theme.prepare_runtime();
+
+        // A surface id keeps reporting the surface, as it always did.
+        assert_eq!(
+            toggle_layer_render_state(&theme, 0, &surface_id, None, runtime),
+            Some(true)
+        );
+        // A layer id used to report nothing, leaving the row unchecked even
+        // while the layer was drawing.
+        assert_eq!(
+            toggle_layer_render_state(&theme, 0, &layer_id, None, runtime),
+            Some(true)
+        );
+        theme.surfaces[0].children[0].render = 0.0.into();
+        theme.prepare_runtime();
+        assert_eq!(
+            toggle_layer_render_state(&theme, 0, &layer_id, None, runtime),
+            Some(false)
+        );
+        // An id that matches nothing has no state to report.
+        assert_eq!(
+            toggle_layer_render_state(&theme, 0, "no-such-object", None, runtime),
+            None
+        );
+    }
+
+    #[test]
+    fn layer_toggle_state_uses_origin_surface_and_live_overrides() {
+        let mut theme = ThemeDocument::starter();
+        let runtime = ThemeRuntime::new(true, true, true);
+        let layer_id = theme.surfaces[0].children[0].id.clone();
+        theme.surfaces[0].children[0].render = 1.0.into();
+        let mut second = theme.surfaces[0].clone();
+        second.id = "second".into();
+        second.children[0].render = 0.0.into();
+        theme.surfaces.push(second);
+        let second_index = theme.surfaces.len() - 1;
+        theme.prepare_runtime();
+        assert_eq!(
+            toggle_layer_render_state(&theme, second_index, &layer_id, None, runtime),
+            Some(false)
+        );
+        let mut overrides = HashMap::new();
+        theme_engine::execute_mouse_actions(
+            &theme,
+            0,
+            &layer_id,
+            "toggle(self, render)",
+            None,
+            runtime,
+            &mut overrides,
+        )
+        .unwrap();
+        let effective = theme_engine::apply_mouse_action_overrides(&theme, &overrides);
+        assert_eq!(
+            toggle_layer_render_state(&effective, 0, &layer_id.to_uppercase(), None, runtime),
+            Some(false)
+        );
+        assert_eq!(
+            toggle_layer_render_state(&theme, 0, &layer_id, None, runtime),
+            Some(true)
+        );
     }
 }
