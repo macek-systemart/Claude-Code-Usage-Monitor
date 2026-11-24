@@ -4,13 +4,14 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 env:
   RELEASE_ASSET_NAME: claude-code-usage-monitor.exe
-  WINGET_PACKAGE_ID: CodeZeno.ClaudeCodeUsageMonitor
+  WINGET_PACKAGE_ID: macekkrystof.ClaudeCodeUsageMonitor
 
 jobs:
   dependency-security:
@@ -36,6 +37,7 @@ jobs:
         run: cargo build --release --locked
 
       - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v3
         with:
           files: target/release/claude-code-usage-monitor.exe
@@ -43,6 +45,7 @@ jobs:
 
   winget:
     needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
     env:
       WINGETCREATE_GITHUB_TOKEN: ${{ secrets.WINGETCREATE_GITHUB_TOKEN }}
